@@ -55,7 +55,7 @@ impl<R: Read> VPXBoolReader<R> {
             hash: SimpleHash::new(),
         };
 
-        r.vpx_reader_fill()?;
+        vpx_reader_fill(&mut r.value, &mut r.count, &mut r.upstream_reader)?;
 
         let mut dummy_branch = Branch::new();
         r.get(&mut dummy_branch, ModelComponent::Dummy)?; // marker bit
@@ -99,13 +99,43 @@ impl<R: Read> VPXBoolReader<R> {
     pub fn get_unary_encoded<const A: usize>(
         &mut self,
         branches: &mut [Branch; A],
-        cmp: ModelComponent,
+        _cmp: ModelComponent,
     ) -> Result<usize> {
         let mut value = 0;
 
+        let mut probability = branches[0].get_probability() as u32;
+
         while value != A {
-            let cur_bit = self.get(&mut branches[value], cmp)?;
-            if !cur_bit {
+            if self.count < 0 {
+                vpx_reader_fill(&mut self.value, &mut self.count, &mut self.upstream_reader)?;
+            }
+
+            let split = 1 + (((self.range - 1) * probability) >> BITS_IN_BYTE);
+            let big_split = (split as u64) << BITS_IN_LONG_MINUS_LAST_BYTE;
+            let bit = self.value >= big_split;
+
+            if bit {
+                if value < A - 1 {
+                    probability = branches[value + 1].get_probability() as u32;
+                }
+
+                let tmp_range = self.range - split;
+                let shift = (tmp_range as u8).leading_zeros() as i32;
+
+                branches[value].record_and_update_true_obs();
+
+                self.value = (self.value - big_split) << shift;
+                self.count -= shift;
+                self.range = tmp_range << shift;
+            } else {
+                // optimizer understands that split > 0, so it can optimize this
+                let shift = (split as u8).leading_zeros() as i32;
+
+                branches[value].record_and_update_false_obs();
+
+                self.value <<= shift;
+                self.count -= shift;
+                self.range = split << shift;
                 break;
             }
 
@@ -134,37 +164,21 @@ impl<R: Read> VPXBoolReader<R> {
 
     #[inline(always)]
     pub fn get(&mut self, branch: &mut Branch, _cmp: ModelComponent) -> Result<bool> {
-        if self.count < 0 {
-            self.vpx_reader_fill()?;
-        }
-
-        let probability = branch.get_probability() as u32;
-
-        let mut tmp_range = self.range;
         let mut tmp_value = self.value;
+        let mut tmp_range = self.range;
+        let mut tmp_count = self.count;
 
-        let split = 1 + (((tmp_range - 1) * probability) >> BITS_IN_BYTE);
-        let big_split = (split as u64) << BITS_IN_LONG_MINUS_LAST_BYTE;
-        let bit = tmp_value >= big_split;
+        let bit = vpx_reader_get(
+            branch,
+            &mut tmp_value,
+            &mut tmp_range,
+            &mut tmp_count,
+            &mut self.upstream_reader,
+        )?;
 
-        let shift;
-        if bit {
-            branch.record_and_update_true_obs();
-            tmp_range -= split;
-            tmp_value -= big_split;
-
-            shift = (tmp_range as u8).leading_zeros() as i32;
-        } else {
-            branch.record_and_update_false_obs();
-            tmp_range = split;
-
-            // optimizer understands that split > 0, so it can optimize this
-            shift = (split as u8).leading_zeros() as i32;
-        }
-
-        self.value = tmp_value << shift;
-        self.count -= shift;
-        self.range = tmp_range << shift;
+        self.value = tmp_value;
+        self.range = tmp_range;
+        self.count = tmp_count;
 
         #[cfg(feature = "compression_stats")]
         {
@@ -192,28 +206,69 @@ impl<R: Read> VPXBoolReader<R> {
 
         return Ok(bit);
     }
+}
 
-    fn vpx_reader_fill(&mut self) -> Result<()> {
-        let mut tmp_value = self.value;
-        let mut tmp_count = self.count;
-        let mut shift = BITS_IN_LONG_MINUS_LAST_BYTE - (tmp_count + BITS_IN_BYTE);
+#[inline(always)]
+fn vpx_reader_get<R: Read>(
+    branch: &mut Branch,
+    tmp_value: &mut u64,
+    tmp_range: &mut u32,
+    tmp_count: &mut i32,
+    upstream_reader: &mut R,
+) -> Result<bool> {
+    if *tmp_count < 0 {
+        vpx_reader_fill(tmp_value, tmp_count, upstream_reader)?;
+    }
 
-        while shift >= 0 {
-            // BufReader is already pretty efficient handling small reads, so optimization doesn't help that much
-            let mut v = [0u8; 1];
-            let bytes_read = self.upstream_reader.read(&mut v[..])?;
-            if bytes_read == 0 {
-                break;
-            }
+    let probability = branch.get_probability() as u32;
 
-            tmp_value |= (v[0] as u64) << shift;
-            shift -= BITS_IN_BYTE;
-            tmp_count += BITS_IN_BYTE;
+    let split = 1 + (((*tmp_range - 1) * probability) >> BITS_IN_BYTE);
+    let big_split = (split as u64) << BITS_IN_LONG_MINUS_LAST_BYTE;
+    let bit = *tmp_value >= big_split;
+
+    if bit {
+        *tmp_range = *tmp_range - split;
+        let shift = (*tmp_range as u8).leading_zeros() as i32;
+
+        branch.record_and_update_true_obs();
+
+        *tmp_value = (*tmp_value - big_split) << shift;
+        *tmp_count -= shift;
+        *tmp_range <<= shift;
+        Ok(true)
+    } else {
+        // optimizer understands that split > 0, so it can optimize this
+        let shift = (split as u8).leading_zeros() as i32;
+
+        branch.record_and_update_false_obs();
+
+        *tmp_value <<= shift;
+        *tmp_count -= shift;
+        *tmp_range = split << shift;
+
+        Ok(false)
+    }
+}
+
+fn vpx_reader_fill<R: Read>(
+    tmp_value: &mut u64,
+    tmp_count: &mut i32,
+    upstream_reader: &mut R,
+) -> Result<()> {
+    let mut shift = BITS_IN_LONG_MINUS_LAST_BYTE - (*tmp_count + BITS_IN_BYTE);
+
+    while shift >= 0 {
+        // BufReader is already pretty efficient handling small reads, so optimization doesn't help that much
+        let mut v = [0u8; 1];
+        let bytes_read = upstream_reader.read(&mut v[..])?;
+        if bytes_read == 0 {
+            break;
         }
 
-        self.value = tmp_value;
-        self.count = tmp_count;
-
-        return Ok(());
+        *tmp_value |= (v[0] as u64) << shift;
+        shift -= BITS_IN_BYTE;
+        *tmp_count += BITS_IN_BYTE;
     }
+
+    return Ok(());
 }
