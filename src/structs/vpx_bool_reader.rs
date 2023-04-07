@@ -103,44 +103,53 @@ impl<R: Read> VPXBoolReader<R> {
     ) -> Result<usize> {
         let mut value = 0;
 
+        let mut tmp_value = self.value;
+        let mut tmp_range = self.range;
+        let mut tmp_count = self.count;
+
         let mut probability = branches[0].get_probability() as u32;
 
         while value != A {
-            if self.count < 0 {
-                vpx_reader_fill(&mut self.value, &mut self.count, &mut self.upstream_reader)?;
+            if tmp_count < 0 {
+                vpx_reader_fill(&mut tmp_value, &mut tmp_count, &mut self.upstream_reader)?;
             }
 
-            let split = 1 + (((self.range - 1) * probability) >> BITS_IN_BYTE);
+            let split = 1 + (((tmp_range - 1) * probability) >> BITS_IN_BYTE);
             let big_split = (split as u64) << BITS_IN_LONG_MINUS_LAST_BYTE;
-            let bit = self.value >= big_split;
+            let bit = tmp_value >= big_split;
 
             if bit {
                 if value < A - 1 {
                     probability = branches[value + 1].get_probability() as u32;
                 }
 
-                let tmp_range = self.range - split;
+                tmp_range -= split;
+                tmp_value -= big_split;
                 let shift = (tmp_range as u8).leading_zeros() as i32;
 
                 branches[value].record_and_update_true_obs();
 
-                self.value = (self.value - big_split) << shift;
-                self.count -= shift;
-                self.range = tmp_range << shift;
+                tmp_value <<= shift;
+                tmp_count -= shift;
+                tmp_range <<= shift;
             } else {
                 // optimizer understands that split > 0, so it can optimize this
                 let shift = (split as u8).leading_zeros() as i32;
 
                 branches[value].record_and_update_false_obs();
 
-                self.value <<= shift;
-                self.count -= shift;
-                self.range = split << shift;
+                tmp_value <<= shift;
+                tmp_count -= shift;
+                tmp_range = split << shift;
                 break;
             }
 
             value += 1;
         }
+
+        self.value = tmp_value;
+        self.range = tmp_range;
+        self.count = tmp_count;
 
         return Ok(value);
     }
